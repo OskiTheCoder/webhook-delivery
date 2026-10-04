@@ -10,9 +10,10 @@ class SendResult:
 
 
 class TransportError(Exception):
-    """An expected network failure prevented obtaining an HTTP response."""
+    """An expected transport failure prevented receiving an HTTP response."""
 
 
 class Sender(Protocol):
     def send(self, url: str, event: EventEnvelope) -> SendResult:
         """Return an HTTP result or raise TransportError."""
+        ...

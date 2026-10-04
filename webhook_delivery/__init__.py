@@ -1,0 +1,1 @@
+"""A small in-memory webhook delivery engine."""

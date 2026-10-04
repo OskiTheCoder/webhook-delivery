@@ -29,6 +29,6 @@ class DeliverySnapshot:
     endpoint_id: str
     event_type: str
     status: DeliveryStatus
-    attempt_count: int
-    last_status_code: int | None
-    last_error: str | None
+    attempt_count: int = 0
+    last_status_code: int | None = None
+    last_error: str | None = None

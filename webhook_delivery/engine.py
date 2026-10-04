@@ -1,11 +1,18 @@
-import uuid
-import math
-import validators
+import json
 from collections import deque
-from typing import Any, List
+from copy import deepcopy
+from dataclasses import dataclass, replace
+from typing import Any
+from urllib.parse import urlsplit
+from uuid import uuid4
 
-from webhook_delivery.models import DeliverySnapshot, DeliveryStatus
-from webhook_delivery.sender import Sender
+from webhook_delivery.models import (
+    DeliverySnapshot,
+    DeliveryStatus,
+    Endpoint,
+    EventEnvelope,
+)
+from webhook_delivery.sender import Sender, TransportError
 
 
 class EndpointNotFoundError(KeyError):
@@ -16,40 +23,89 @@ class DeliveryNotFoundError(KeyError):
     """The requested delivery does not exist."""
 
 
-class DeliveryEngine:
-    """In-memory, single-threaded delivery engine.
+@dataclass
+class _Delivery:
+    event: EventEnvelope
+    snapshot: DeliverySnapshot
 
-    Processing is synchronous and explicitly initiated by the caller.
-    Expected transport failures are recorded; unexpected exceptions propagate.
+
+def _validate_url(url: str) -> None:
+    if not isinstance(url, str) or not url:
+        raise ValueError("url must be a nonempty string")
+
+    if any(character.isspace() or ord(character) < 32 for character in url):
+        raise ValueError("url must not contain whitespace or control characters")
+
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        # Accessing port also validates its format and range.
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid url") from exc
+
+    if parsed.scheme not in {"http", "https"} or not hostname:
+        raise ValueError("url must be absolute HTTP(S) with a hostname")
+
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("url must not contain credentials")
+
+    if "#" in url:
+        raise ValueError("url must not contain a fragment")
+
+
+def _check_json_types(value: Any) -> None:
+    """Require JSON types and string keys, including nested values."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("payload dictionary keys must be strings")
+            _check_json_types(item)
+    elif isinstance(value, list):
+        for item in value:
+            _check_json_types(item)
+    elif value is not None and not isinstance(value, (str, bool, int, float)):
+        raise ValueError("payload contains an unsupported JSON type")
+
+
+def _capture_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a dictionary")
+
+    try:
+        # Reject circular references, unsupported values, and nonfinite floats.
+        serialized = json.dumps(payload, allow_nan=False)
+
+        # json.dumps permits non-string keys and tuples; our contract does not.
+        _check_json_types(payload)
+
+        # The round trip also creates an independent nested payload.
+        return json.loads(serialized)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ValueError(
+            "payload must contain valid JSON types and string keys"
+        ) from exc
+
+
+class DeliveryEngine:
+    """In-memory, single-threaded engine with explicit synchronous processing.
+
+    Each delivery receives one attempt. Expected failures are recorded.
+    Completed records remain in memory for the lifetime of the engine.
     """
 
     def __init__(self, sender: Sender) -> None:
         self._sender = sender
-        self._endpoints_mapping: dict[str, List[str]] = {}
-        self._delivery_mapping: dict[str, DeliverySnapshot] = {}
-        self._endpoints: set[str] = set()
-        self._events: deque[DeliverySnapshot] = deque()
+        self._endpoints: dict[str, Endpoint] = {}
+        self._deliveries: dict[str, _Delivery] = {}
+        self._pending: deque[str] = deque()
 
     def register_endpoint(self, url: str) -> str:
-        """Register an endpoint and return its unique ID.
+        _validate_url(url)
 
-        Require an absolute HTTP(S) URL with a hostname.
-        Reject credentials and fragments.
-        Duplicate URLs create separate registrations.
-
-        Raises:
-            ValueError: If the URL is invalid.
-        """
-        if not self._is_valid_webhook_url(url):
-            raise ValueError("invalid url")
-        if url not in self._endpoints_mapping:
-            self._endpoints[url] = []
-        
-        endpoint_id = str(uuid.uuid4())
-        self._endpoints_mapping[url].append(endpoint_id)
-        self._endpoints.add(endpoint_id)
+        endpoint_id = str(uuid4())
+        self._endpoints[endpoint_id] = Endpoint(id=endpoint_id, url=url)
         return endpoint_id
-        
 
     def submit_event(
         self,
@@ -57,93 +113,81 @@ class DeliveryEngine:
         event_type: str,
         payload: dict[str, Any],
     ) -> str:
-        """Capture an event and queue one delivery; return its delivery ID.
-
-        Require a nonblank event type and a JSON-compatible dictionary.
-        Reject nonfinite floats and non-string dictionary keys.
-        Isolate the captured payload from subsequent caller mutations.
-        Each submission creates a new event ID and delivery ID.
-
-        Raises:
-            EndpointNotFoundError: If the endpoint is unknown.
-            ValueError: If the event type or payload is invalid.
-        """
         if endpoint_id not in self._endpoints:
-            raise EndpointNotFoundError()
-        if not event_type:
-            raise ValueError(f"event type {event_type} is invalid")
-        if not self._check_strict_json(payload):
-            raise ValueError("invalid payload. payload should be a JSON-compatible dictionary")
-        
-        event_id = str(uuid.uuid4())
-        delivery_id = str(uuid.uuid4())
-        delivery = DeliverySnapshot(
+            raise EndpointNotFoundError(endpoint_id)
+
+        if not isinstance(event_type, str) or not event_type.strip():
+            raise ValueError("event_type must be a nonblank string")
+
+        # Validate and copy before modifying engine state.
+        captured_payload = _capture_payload(payload)
+
+        event = EventEnvelope(
+            id=str(uuid4()),
+            type=event_type,
+            data=captured_payload,
+        )
+        delivery_id = str(uuid4())
+        snapshot = DeliverySnapshot(
             delivery_id=delivery_id,
-            event_id=event_id,
+            event_id=event.id,
             endpoint_id=endpoint_id,
             event_type=event_type,
             status=DeliveryStatus.PENDING,
-            attempt_count=0,
-            last_status_code=None,
-            last_error=None
         )
-        self._events.append(delivery)
-        self._delivery_mapping[delivery_id] = delivery
+
+        self._deliveries[delivery_id] = _Delivery(
+            event=event,
+            snapshot=snapshot,
+        )
+        self._pending.append(delivery_id)
         return delivery_id
 
     def get_delivery(self, delivery_id: str) -> DeliverySnapshot:
-        """Return a detached snapshot of the delivery.
+        try:
+            delivery = self._deliveries[delivery_id]
+        except KeyError:
+            raise DeliveryNotFoundError(delivery_id) from None
 
-        Raises:
-            DeliveryNotFoundError: If the delivery is unknown.
-        """
-        if not delivery_id or delivery_id not in self._delivery_mapping:
-            raise DeliveryNotFoundError()
-        return self._delivery_mapping[delivery_id]
+        # All snapshot fields are immutable; a shallow dataclass copy suffices.
+        return replace(delivery.snapshot)
 
     def process_next(self) -> DeliverySnapshot | None:
-        """Attempt the oldest pending delivery, or return None if empty.
+        if not self._pending:
+            return None
 
-        Call the sender with an isolated event envelope.
-        Count one attempt.
-        Mark HTTP 2xx as succeeded.
-        Mark other HTTP responses or TransportError as failed.
-        Record the status code or error as appropriate.
-        Return the updated delivery snapshot.
+        delivery_id = self._pending[0]
+        delivery = self._deliveries[delivery_id]
+        endpoint = self._endpoints[delivery.snapshot.endpoint_id]
 
-        No retries in this milestone. Unexpected exceptions propagate.
-        """
-        raise NotImplementedError
+        status_code = None
+        error = None
 
-    def _is_valid_webhook_url(self, value: str) -> bool:
-        return validators.url(
-            value,
-            validate_scheme=lambda scheme: scheme.lower() in {"http", "https"},
-            simple_host=True,
-        ) is True
+        try:
+            # frozen=True does not protect nested data, so isolate the payload.
+            result = self._sender.send(
+                endpoint.url,
+                deepcopy(delivery.event),
+            )
+            status_code = result.status_code
+            if 200 <= status_code < 300:
+                status = DeliveryStatus.SUCCEEDED
+            else:
+                status = DeliveryStatus.FAILED
+                error = f"HTTP {status_code}"
+        except TransportError as exc:
+            status = DeliveryStatus.FAILED
+            error = str(exc) or "transport failure"
 
-    
-    def _check_strict_json(self, obj) -> bool:
-        # 1. Handle Dictionaries
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                if not isinstance(key, str):  # Reject non-string keys
-                    return False
-                if not self._check_strict_json(value):  # Recursively check values
-                    return False
-            return True
+        # Unexpected exceptions propagate before this point, leaving the
+        # delivery pending. There is no automatic retry for programming errors.
+        delivery.snapshot = replace(
+            delivery.snapshot,
+            status=status,
+            attempt_count=delivery.snapshot.attempt_count + 1,
+            last_status_code=status_code,
+            last_error=error,
+        )
+        self._pending.popleft()
 
-        # 2. Handle Lists/Arrays
-        if isinstance(obj, list):
-            return all(self._check_strict_json(item) for item in obj)
-
-        # 3. Handle Floats (Reject NaN and Inf)
-        if isinstance(obj, float):
-            return math.isfinite(obj)
-
-        # 4. Handle other valid JSON primitives
-        if obj is None or isinstance(obj, (int, bool, str)):
-            return True
-
-        # Reject custom objects, sets, tuples, etc.
-        return False
+        return self.get_delivery(delivery_id)
